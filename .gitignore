@@ -1,0 +1,23 @@
+# Rust
+/target/
+Cargo.lock
+
+# FFI build output
+rust/tandem-ffi/lua/*.so
+rust/tandem-ffi/lua/*.dylib
+
+# Logs
+*.log
+/tmp/
+
+# AI docs (reference only, not committed)
+/ai-docs/
+
+# Editor
+.idea/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store

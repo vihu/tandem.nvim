@@ -1,0 +1,34 @@
+[workspace]
+resolver = "2"
+members = ["rust/tandem-ffi", "rust/tandem-server"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/vihu/tandem.nvim"
+
+[workspace.dependencies]
+aes-gcm = "0.10"
+base64 = "0.22"
+base64ct = { version = "1", features = ["alloc"] }
+chrono = { version = "0.4", features = ["serde"] }
+env_logger = "0.11"
+futures-util = "0.3"
+jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto"] }
+log = "0.4"
+log4rs = "1.4"
+log-panics = "2"
+loro = "1"
+nvim-oxi = { version = "0.6", features = ["neovim-0-11", "mlua", "libuv"] }
+parking_lot = "0.12"
+rand = "0.9"
+rmp-serde = "1"
+rmpv = { version = "1", features = ["with-serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_bytes = "0.11"
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = "0.28"
+url = "2"
+uuid = { version = "1", features = ["v4"] }
