@@ -247,10 +247,23 @@ impl CrdtDoc {
         let update_bytes = match base64::engine::general_purpose::STANDARD.decode(update_b64) {
             Ok(bytes) => bytes,
             Err(e) => {
-                error!("[crdt:{}] Failed to decode update base64: {}", self.id, e);
+                error!(
+                    "[crdt:{}] Failed to decode update base64: {} (len={})",
+                    self.id,
+                    e,
+                    update_b64.len()
+                );
                 return false;
             }
         };
+
+        let text_before = self.get_text();
+        info!(
+            "[crdt:{}] Importing update: {} bytes raw, CRDT text before: {} bytes",
+            self.id,
+            update_bytes.len(),
+            text_before.len()
+        );
 
         // Import the update - this triggers the subscription callback
         // which will queue any TextDelta events to pending_deltas
@@ -261,10 +274,11 @@ impl CrdtDoc {
 
         // Update last_text for debugging
         self.last_text = self.get_text();
-        debug!(
-            "[crdt:{}] Applied update, text now {} bytes",
+        info!(
+            "[crdt:{}] Import successful, text now {} bytes (was {} bytes)",
             self.id,
-            self.last_text.len()
+            self.last_text.len(),
+            text_before.len()
         );
 
         true

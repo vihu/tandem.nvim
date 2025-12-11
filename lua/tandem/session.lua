@@ -16,6 +16,28 @@ local M = {}
 local buffer = require("tandem.buffer")
 local cursor = require("tandem.cursor")
 
+--- Check if a string looks like valid base64url (used for encrypted data)
+--- @param s string
+--- @return boolean
+local function is_valid_base64url(s)
+	if type(s) ~= "string" or s == "" then
+		return false
+	end
+	if s:find("[+/=]") then
+		return false
+	end
+	if s:find("[^A-Za-z0-9_-]") then
+		return false
+	end
+	if #s < 38 then
+		return false
+	end
+	return true
+end
+
+-- Silence unused warning
+local _ = is_valid_base64url
+
 -- Session state
 local session = {
 	ws_client_id = nil,
@@ -82,11 +104,11 @@ local function log(level, msg)
 		vim.notify(prefix .. msg, vim.log.levels.ERROR)
 	elseif level == "WARN" then
 		vim.notify(prefix .. msg, vim.log.levels.WARN)
-	elseif level == "INFO" then
-		vim.notify(prefix .. msg, vim.log.levels.INFO)
-	elseif level == "DEBUG" then
-		-- Disabled by default
-		-- print(prefix .. msg)
+	elseif level == "INFO" or level == "DEBUG" then
+		-- Only show INFO/DEBUG when debug mode is enabled
+		if config.debug then
+			vim.notify(prefix .. msg, vim.log.levels.INFO)
+		end
 	end
 end
 
@@ -174,6 +196,7 @@ local function send_local_updates(force)
 	end
 
 	if update_b64 and update_b64 ~= "" then
+		-- Note: E2E encryption is handled transparently in Rust FFI layer
 		session.ffi.ws.send_update(session.ws_client_id, update_b64)
 		session.last_sent_sv = current_sv
 		session.pending_update = false
@@ -195,6 +218,7 @@ local function handle_sync_response(_client_id, snapshot_b64)
 		return
 	end
 
+	-- Note: E2E decryption is handled transparently in Rust FFI layer
 	-- Apply snapshot if present (even if just metadata, won't hurt)
 	if snapshot_b64 and snapshot_b64 ~= "" then
 		log("DEBUG", "Applying server snapshot")
@@ -249,6 +273,7 @@ local function handle_sync_response(_client_id, snapshot_b64)
 			session.ffi.crdt.doc_set_text(session.doc_id, buf_content)
 
 			-- Push our state to server for future joiners
+			-- Note: E2E encryption is handled transparently in Rust FFI layer
 			local state_b64 = session.ffi.crdt.doc_encode_full_state(session.doc_id)
 			if state_b64 and state_b64 ~= "" then
 				log("INFO", "Pushing initial document state to server")
@@ -260,22 +285,27 @@ local function handle_sync_response(_client_id, snapshot_b64)
 	else
 		-- Empty sync response AND we are a joiner - wait for host state
 		local buf_content = buffer.get_content(session.bufnr)
-		if buf_content and buf_content ~= "" then
+		-- Check if buffer has real content (not just a trailing newline from empty buffer)
+		local has_real_content = buf_content and buf_content ~= "" and buf_content ~= "\n"
+		if has_real_content then
 			log("INFO", "Empty sync response (joiner), waiting 500ms for host state...")
 			vim.defer_fn(function()
 				local current_content = session.ffi.crdt.doc_get_text(session.doc_id)
 				if current_content == "" then
 					log("INFO", "No host state received, initializing from buffer")
 					local content = buffer.get_content(session.bufnr)
-					if content and content ~= "" then
+					-- Only initialize if we have real content
+					if content and content ~= "" and content ~= "\n" then
 						session.ffi.crdt.doc_set_text(session.doc_id, content)
 						local state_b64 = session.ffi.crdt.doc_encode_full_state(session.doc_id)
 						if state_b64 and state_b64 ~= "" then
 							session.ffi.ws.send_update(session.ws_client_id, state_b64)
 						end
+					else
+						log("INFO", "Buffer is empty, waiting for host updates")
 					end
 				else
-					log("INFO", "Received host state while waiting")
+					log("INFO", "Received host state while waiting (" .. #current_content .. " bytes)")
 				end
 			end, 500)
 		else
@@ -295,7 +325,14 @@ end
 --- @param _client_id string Client ID (ignored)
 --- @param update_b64 string Base64-encoded CRDT update
 local function handle_update(_client_id, update_b64)
-	vim.notify("[tandem] RECV update, b64_len=" .. #update_b64, vim.log.levels.DEBUG)
+	local b64_len = update_b64 and #update_b64 or 0
+	log("INFO", "RECV update, b64_len=" .. b64_len)
+
+	-- Log warning for empty updates (could indicate decryption failure)
+	if not update_b64 or update_b64 == "" then
+		log("WARN", "Received empty update - possible decryption failure")
+		return
+	end
 
 	if update_b64 and update_b64 ~= "" then
 		-- Validate buffer still exists
@@ -313,15 +350,29 @@ local function handle_update(_client_id, update_b64)
 		-- Use force=true to skip debounce - we must send before applying remote
 		send_local_updates(true)
 
+		-- Log CRDT state before apply
+		local crdt_before = session.ffi.crdt.doc_get_text(session.doc_id)
+		log("DEBUG", "CRDT before apply: " .. #crdt_before .. " bytes")
+
 		-- Apply remote update to CRDT (this always happens - CRDT handles merge)
-		local ok, applied = pcall(function()
+		local ok, result = pcall(function()
 			return session.ffi.crdt.doc_apply_update(session.doc_id, update_b64)
 		end)
 
 		if not ok then
-			log("ERROR", "CRDT apply failed: " .. tostring(applied))
+			log("ERROR", "CRDT apply exception: " .. tostring(result))
 			return
 		end
+
+		-- Check if import actually succeeded (doc_apply_update returns bool)
+		if result == false then
+			log("ERROR", "CRDT import failed (returned false) - update may be invalid")
+			return
+		end
+
+		-- Log CRDT state after apply
+		local crdt_after = session.ffi.crdt.doc_get_text(session.doc_id)
+		log("DEBUG", "CRDT after apply: " .. #crdt_after .. " bytes")
 
 		-- Update last_sent_sv to prevent echoing this update back
 		session.last_sent_sv = session.ffi.crdt.doc_state_vector(session.doc_id)
@@ -520,8 +571,8 @@ attempt_reconnect = function()
 			-- Register callbacks for new client
 			register_ws_callbacks(new_client_id)
 
-			-- Connect with new client ID
-			local ok = session.ffi.ws.connect(new_client_id, session.server_url)
+			-- Connect with new client ID (pass encryption key if present)
+			local ok = session.ffi.ws.connect(new_client_id, session.server_url, session.encryption_key or "")
 			if not ok then
 				log("WARN", "Reconnect failed, will retry...")
 				unregister_ws_callbacks(new_client_id)
@@ -716,7 +767,8 @@ function M.join(server_url, doc_id, ffi_ref)
 	register_ws_callbacks(session.ws_client_id)
 
 	-- Connect WebSocket (callbacks will be invoked on events)
-	local ok = session.ffi.ws.connect(session.ws_client_id, server_url)
+	-- Note: M.join doesn't use E2EE, use M.host/M.join_with_code for encrypted sessions
+	local ok = session.ffi.ws.connect(session.ws_client_id, server_url, "")
 	if not ok then
 		log("ERROR", "Failed to connect to " .. server_url)
 		unregister_ws_callbacks(session.ws_client_id)
@@ -858,23 +910,36 @@ end
 --- Get a short status string for statusline integration
 --- @return string
 function M.statusline()
-	if not M.is_active() then
+	-- Check P2P first, then regular session
+	local info
+	local mode_prefix
+	if M.is_p2p_active() then
+		info = M.p2p_info()
+		mode_prefix = "P2P"
+	elseif M.is_active() then
+		info = M.info()
+		mode_prefix = "WS"
+	else
 		return ""
 	end
 
-	local info = M.info()
-	local lock = info.encrypted and "[E2EE]" or ""
+	local lock = info.encrypted and "[E2E]" or ""
 
 	if info.state == "synced" then
-		return "[Tandem: synced" .. lock .. "]"
+		return "[Tandem " .. mode_prefix .. ": synced" .. lock .. "]"
 	elseif info.state == "connected" then
-		return "[Tandem: connected" .. lock .. "]"
+		return "[Tandem " .. mode_prefix .. ": connected" .. lock .. "]"
 	elseif info.state == "reconnecting" then
-		return string.format("[Tandem: reconnecting %d/%d]", info.reconnect_attempts, config.reconnect_max_retries)
+		return string.format(
+			"[Tandem %s: reconnecting %d/%d]",
+			mode_prefix,
+			info.reconnect_attempts or 0,
+			config.reconnect_max_retries
+		)
 	elseif info.state == "connecting" then
-		return "[Tandem: connecting...]"
+		return "[Tandem " .. mode_prefix .. ": connecting...]"
 	else
-		return "[Tandem: disconnected]"
+		return "[Tandem " .. mode_prefix .. ": disconnected]"
 	end
 end
 
@@ -1011,8 +1076,8 @@ function M.host(doc_name, ffi_ref)
 	session.ws_client_id = session.ffi.ws.generate_client_id()
 	register_ws_callbacks(session.ws_client_id)
 
-	-- Connect WebSocket
-	local ok = session.ffi.ws.connect(session.ws_client_id, ws_url)
+	-- Connect WebSocket with E2E encryption key
+	local ok = session.ffi.ws.connect(session.ws_client_id, ws_url, session.encryption_key)
 	if not ok then
 		log("ERROR", "Failed to connect to " .. ws_url)
 		unregister_ws_callbacks(session.ws_client_id)
@@ -1026,7 +1091,7 @@ function M.host(doc_name, ffi_ref)
 		session.document_name = nil
 		return false, nil
 	end
-	log("INFO", "Connecting to " .. ws_url)
+	log("INFO", "Connecting to " .. ws_url .. " (E2EE enabled)")
 
 	-- Start connection timeout timer
 	session.connect_start_time = vim.uv.now()
@@ -1135,8 +1200,8 @@ function M.join_with_code(code, ffi_ref)
 	session.ws_client_id = session.ffi.ws.generate_client_id()
 	register_ws_callbacks(session.ws_client_id)
 
-	-- Connect WebSocket
-	local ok = session.ffi.ws.connect(session.ws_client_id, ws_url)
+	-- Connect WebSocket with E2E encryption key
+	local ok = session.ffi.ws.connect(session.ws_client_id, ws_url, session.encryption_key)
 	if not ok then
 		log("ERROR", "Failed to connect to " .. ws_url)
 		unregister_ws_callbacks(session.ws_client_id)
@@ -1150,7 +1215,7 @@ function M.join_with_code(code, ffi_ref)
 		session.document_name = nil
 		return false
 	end
-	log("INFO", "Connecting to " .. ws_url)
+	log("INFO", "Connecting to " .. ws_url .. " (E2EE enabled)")
 
 	-- Start connection timeout timer
 	session.connect_start_time = vim.uv.now()
@@ -1182,6 +1247,435 @@ end
 --- @return string|nil
 function M.get_session_code()
 	return session.session_code
+end
+
+-- ============================================================================
+-- P2P Mode (Iroh)
+-- ============================================================================
+
+--- Register Iroh P2P callbacks in Lua globals
+--- @param client_id string Client UUID
+local function register_iroh_callbacks(client_id)
+	-- Ensure global table exists
+	_G["_TANDEM_NVIM"] = _G["_TANDEM_NVIM"] or {}
+	_G["_TANDEM_NVIM"].iroh = _G["_TANDEM_NVIM"].iroh or { callbacks = {} }
+
+	-- Callbacks for P2P mode
+	_G["_TANDEM_NVIM"].iroh.callbacks[client_id] = {
+		on_ready = function(_id, endpoint_id, relay_url)
+			log("INFO", "P2P endpoint ready: " .. endpoint_id)
+
+			-- Generate session code for sharing
+			local ok_encode, code = pcall(function()
+				return session.ffi.code.encode_p2p(endpoint_id, relay_url)
+			end)
+			if ok_encode then
+				session.session_code = code
+				session.endpoint_id = endpoint_id
+				session.relay_url = relay_url
+				log("INFO", "Session code generated: " .. code:sub(1, 20) .. "...")
+			else
+				log("ERROR", "Failed to encode P2P session code: " .. tostring(code))
+			end
+		end,
+
+		on_peer_connected = function(_id, peer_id)
+			log("INFO", "Peer connected: " .. peer_id)
+			session.connected = true
+
+			-- If we're the host and have content, send full state to new peer
+			if session.role == "host" then
+				local state_b64 = session.ffi.crdt.doc_encode_full_state(session.doc_id)
+				if state_b64 and state_b64 ~= "" then
+					log("INFO", "Sending full state to peer (" .. #state_b64 .. " bytes)")
+					session.ffi.iroh.send_full_state(session.iroh_client_id, state_b64)
+				end
+			end
+
+			session.synced = true
+		end,
+
+		on_peer_disconnected = function(_id, peer_id)
+			log("WARN", "Peer disconnected: " .. peer_id)
+			-- Don't set connected=false if we're host (other peers may still connect)
+			if session.role ~= "host" then
+				session.connected = false
+				session.synced = false
+			end
+		end,
+
+		on_full_state = function(_id, state_b64)
+			log("INFO", "Received full state (" .. #state_b64 .. " bytes)")
+
+			if not session.bufnr or not vim.api.nvim_buf_is_valid(session.bufnr) then
+				log("ERROR", "Buffer no longer valid")
+				return
+			end
+
+			-- Apply full state to CRDT
+			local ok, err = pcall(function()
+				return session.ffi.crdt.doc_apply_update(session.doc_id, state_b64)
+			end)
+			if not ok then
+				log("ERROR", "Failed to apply full state: " .. tostring(err))
+				return
+			end
+
+			-- Update buffer from CRDT
+			local crdt_content = session.ffi.crdt.doc_get_text(session.doc_id)
+			session.sync_lockout_until = vim.uv.now() + 100
+			buffer.set_content(session.bufnr, crdt_content)
+			session.last_sent_sv = session.ffi.crdt.doc_state_vector(session.doc_id)
+			session.synced = true
+			log("INFO", "Applied full state (" .. #crdt_content .. " bytes)")
+		end,
+
+		on_update = function(_id, update_b64)
+			log("DEBUG", "Received update (" .. #update_b64 .. " bytes)")
+
+			if not session.bufnr or not vim.api.nvim_buf_is_valid(session.bufnr) then
+				return
+			end
+
+			-- Send pending local updates first
+			send_local_updates(true)
+
+			-- Apply remote update to CRDT
+			local ok, result = pcall(function()
+				return session.ffi.crdt.doc_apply_update(session.doc_id, update_b64)
+			end)
+			if not ok or result == false then
+				log("ERROR", "Failed to apply update: " .. tostring(result))
+				return
+			end
+
+			-- Update state vector
+			session.last_sent_sv = session.ffi.crdt.doc_state_vector(session.doc_id)
+
+			-- Check if user is editing
+			local now = vim.uv.now()
+			local time_since_edit = now - session.last_edit_time
+			if time_since_edit < config.edit_debounce_ms then
+				session.has_deferred_remote_update = true
+				return
+			end
+
+			-- Update buffer from CRDT
+			local crdt_content = session.ffi.crdt.doc_get_text(session.doc_id)
+			local buf_content = buffer.get_content(session.bufnr)
+			if crdt_content ~= buf_content then
+				session.ffi.crdt.doc_clear_deltas(session.doc_id)
+				session.sync_lockout_until = vim.uv.now() + 100
+				buffer.set_content(session.bufnr, crdt_content)
+			end
+		end,
+
+		on_error = function(_id, err)
+			log("ERROR", "P2P error: " .. err)
+			session.connected = false
+			session.synced = false
+		end,
+	}
+
+	log("DEBUG", "Registered Iroh callbacks for client " .. client_id)
+end
+
+--- Unregister Iroh callbacks
+--- @param client_id string Client UUID
+local function unregister_iroh_callbacks(client_id)
+	if _G["_TANDEM_NVIM"] and _G["_TANDEM_NVIM"].iroh and _G["_TANDEM_NVIM"].iroh.callbacks then
+		_G["_TANDEM_NVIM"].iroh.callbacks[client_id] = nil
+	end
+end
+
+--- Send local CRDT updates via P2P
+local function send_p2p_updates(force)
+	if not session.connected or not session.synced or not session.doc_id then
+		return
+	end
+
+	if not session.has_local_edits then
+		session.pending_update = false
+		return
+	end
+
+	session.pending_update = true
+
+	if not force then
+		local now = vim.uv.now()
+		local elapsed = now - session.last_edit_time
+		if elapsed < config.edit_debounce_ms then
+			return
+		end
+	end
+
+	local current_sv = session.ffi.crdt.doc_state_vector(session.doc_id)
+
+	local update_b64
+	if session.last_sent_sv and session.last_sent_sv ~= "" then
+		update_b64 = session.ffi.crdt.doc_encode_update(session.doc_id, session.last_sent_sv)
+	else
+		update_b64 = session.ffi.crdt.doc_encode_full_state(session.doc_id)
+	end
+
+	if update_b64 and update_b64 ~= "" then
+		session.ffi.iroh.send_update(session.iroh_client_id, update_b64)
+		session.last_sent_sv = current_sv
+		session.pending_update = false
+		session.has_local_edits = false
+	end
+end
+
+--- P2P poll loop
+local function p2p_poll_loop()
+	if session.bufnr and not vim.api.nvim_buf_is_valid(session.bufnr) then
+		log("WARN", "Buffer was deleted, leaving P2P session")
+		M.leave_p2p()
+		return
+	end
+
+	if session.connected and session.synced then
+		send_p2p_updates()
+
+		if session.has_deferred_remote_update then
+			local now = vim.uv.now()
+			local time_since_edit = now - session.last_edit_time
+			if time_since_edit >= config.edit_debounce_ms and not session.pending_update then
+				sync_buffer_from_crdt()
+				session.has_deferred_remote_update = false
+			end
+		end
+	end
+end
+
+--- Start P2P poll timer
+local function start_p2p_poll_timer()
+	if session.crdt_poll_timer then
+		session.crdt_poll_timer:stop()
+		session.crdt_poll_timer:close()
+	end
+	session.crdt_poll_timer = vim.uv.new_timer()
+	session.crdt_poll_timer:start(0, config.crdt_poll_interval_ms, vim.schedule_wrap(p2p_poll_loop))
+end
+
+--- Host a P2P session (no server required)
+--- @param ffi_ref table Reference to tandem_ffi
+--- @return boolean success
+--- @return string|nil session_code The session code to share (available after on_ready callback)
+function M.host_p2p(ffi_ref)
+	if session.iroh_client_id then
+		log("WARN", "Already in a P2P session, leave first")
+		return false, nil
+	end
+
+	session.ffi = ffi_ref
+	session.intentional_disconnect = false
+	session.role = "host"
+
+	-- Get current buffer
+	session.bufnr = vim.api.nvim_get_current_buf()
+	if not vim.api.nvim_buf_is_valid(session.bufnr) then
+		log("ERROR", "Invalid buffer")
+		return false, nil
+	end
+
+	-- Create CRDT document
+	session.doc_id = session.ffi.crdt.doc_create()
+	log("INFO", "Created CRDT doc: " .. session.doc_id)
+
+	-- Initialize CRDT from buffer content
+	local buf_content = buffer.get_content(session.bufnr)
+	if buf_content and buf_content ~= "" and buf_content ~= "\n" then
+		session.ffi.crdt.doc_set_text(session.doc_id, buf_content)
+		log("INFO", "Initialized CRDT from buffer (" .. #buf_content .. " bytes)")
+	end
+
+	-- Attach buffer to CRDT
+	if not buffer.attach(session.bufnr, session.doc_id, session.ffi) then
+		log("ERROR", "Failed to attach buffer")
+		session.ffi.crdt.doc_destroy(session.doc_id)
+		session.doc_id = nil
+		return false, nil
+	end
+
+	-- Set up edit callback
+	buffer.set_on_edit_callback(on_buffer_edit)
+
+	-- Set up cursor tracking
+	cursor.setup(session.bufnr, config.user_name)
+
+	-- Generate client ID and register callbacks
+	session.iroh_client_id = session.ffi.iroh.generate_client_id()
+	register_iroh_callbacks(session.iroh_client_id)
+
+	-- Start hosting
+	local ok = session.ffi.iroh.host(session.iroh_client_id)
+	if not ok then
+		log("ERROR", "Failed to start P2P host")
+		unregister_iroh_callbacks(session.iroh_client_id)
+		buffer.detach(session.bufnr)
+		session.ffi.crdt.doc_destroy(session.doc_id)
+		session.doc_id = nil
+		session.iroh_client_id = nil
+		return false, nil
+	end
+
+	log("INFO", "P2P host started, waiting for endpoint ready...")
+
+	-- Start poll timer
+	start_p2p_poll_timer()
+
+	-- Session code will be available after on_ready callback
+	return true, nil
+end
+
+--- Join a P2P session using a session code
+--- @param code string The P2P session code
+--- @param ffi_ref table Reference to tandem_ffi
+--- @return boolean success
+function M.join_p2p(code, ffi_ref)
+	if session.iroh_client_id then
+		log("WARN", "Already in a P2P session, leave first")
+		return false
+	end
+
+	session.ffi = ffi_ref
+	session.intentional_disconnect = false
+	session.role = "joiner"
+	session.session_code = code
+
+	-- Get current buffer
+	session.bufnr = vim.api.nvim_get_current_buf()
+	if not vim.api.nvim_buf_is_valid(session.bufnr) then
+		log("ERROR", "Invalid buffer")
+		return false
+	end
+
+	-- Create CRDT document
+	session.doc_id = session.ffi.crdt.doc_create()
+	log("INFO", "Created CRDT doc: " .. session.doc_id)
+
+	-- Attach buffer to CRDT
+	if not buffer.attach(session.bufnr, session.doc_id, session.ffi) then
+		log("ERROR", "Failed to attach buffer")
+		session.ffi.crdt.doc_destroy(session.doc_id)
+		session.doc_id = nil
+		return false
+	end
+
+	-- Set up edit callback
+	buffer.set_on_edit_callback(on_buffer_edit)
+
+	-- Set up cursor tracking
+	cursor.setup(session.bufnr, config.user_name)
+
+	-- Generate client ID and register callbacks
+	session.iroh_client_id = session.ffi.iroh.generate_client_id()
+	register_iroh_callbacks(session.iroh_client_id)
+
+	-- Join the session
+	local ok = session.ffi.iroh.join(session.iroh_client_id, code)
+	if not ok then
+		log("ERROR", "Failed to join P2P session")
+		unregister_iroh_callbacks(session.iroh_client_id)
+		buffer.detach(session.bufnr)
+		session.ffi.crdt.doc_destroy(session.doc_id)
+		session.doc_id = nil
+		session.iroh_client_id = nil
+		session.session_code = nil
+		return false
+	end
+
+	log("INFO", "Joining P2P session...")
+
+	-- Start poll timer
+	start_p2p_poll_timer()
+
+	return true
+end
+
+--- Leave a P2P session
+function M.leave_p2p()
+	session.intentional_disconnect = true
+
+	-- Stop poll timer
+	if session.crdt_poll_timer then
+		session.crdt_poll_timer:stop()
+		session.crdt_poll_timer:close()
+		session.crdt_poll_timer = nil
+	end
+
+	-- Close Iroh client
+	if session.iroh_client_id then
+		if session.ffi then
+			session.ffi.iroh.close(session.iroh_client_id)
+		end
+		unregister_iroh_callbacks(session.iroh_client_id)
+		session.iroh_client_id = nil
+	end
+
+	-- Clean up cursor tracking
+	cursor.cleanup()
+
+	-- Detach buffer
+	buffer.set_on_edit_callback(nil)
+	if session.bufnr then
+		buffer.detach(session.bufnr)
+		session.bufnr = nil
+	end
+
+	-- Destroy CRDT doc
+	if session.doc_id and session.ffi then
+		session.ffi.crdt.doc_destroy(session.doc_id)
+		session.doc_id = nil
+	end
+
+	-- Reset state
+	session.connected = false
+	session.synced = false
+	session.last_sent_sv = nil
+	session.last_edit_time = 0
+	session.pending_update = false
+	session.has_deferred_remote_update = false
+	session.has_local_edits = false
+	session.sync_lockout_until = 0
+	session.session_code = nil
+	session.endpoint_id = nil
+	session.relay_url = nil
+	session.role = nil
+
+	log("INFO", "Left P2P session")
+end
+
+--- Check if in a P2P session
+--- @return boolean
+function M.is_p2p_active()
+	return session.iroh_client_id ~= nil
+end
+
+--- Get P2P session info
+--- @return table
+function M.p2p_info()
+	local state = "disconnected"
+	if session.connected and session.synced then
+		state = "synced"
+	elseif session.connected then
+		state = "connected"
+	elseif session.iroh_client_id then
+		state = "connecting"
+	end
+
+	return {
+		active = M.is_p2p_active(),
+		state = state,
+		connected = session.connected,
+		synced = session.synced,
+		bufnr = session.bufnr,
+		session_code = session.session_code,
+		endpoint_id = session.endpoint_id,
+		role = session.role,
+		encrypted = true, -- P2P always uses QUIC/TLS
+	}
 end
 
 return M

@@ -3,15 +3,12 @@
 Cargo.lock
 
 # FFI build output
-rust/tandem-ffi/lua/*.so
-rust/tandem-ffi/lua/*.dylib
+lua/*.so
+lua/*.dylib
 
 # Logs
 *.log
 /tmp/
-
-# AI docs (reference only, not committed)
-/ai-docs/
 
 # Editor
 .idea/

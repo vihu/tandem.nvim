@@ -16,6 +16,10 @@ pub enum ClientMsg {
     #[serde(rename = "u")]
     #[serde(with = "serde_bytes")]
     Update(Vec<u8>),
+    /// E2E encrypted update (opaque blob, server just relays)
+    #[serde(rename = "x")]
+    #[serde(with = "serde_bytes")]
+    EncryptedUpdate(Vec<u8>),
     /// Awareness update (cursor/presence)
     #[serde(rename = "a")]
     Awareness(rmpv::Value),
@@ -33,6 +37,10 @@ pub enum ServerMsg {
     #[serde(rename = "u")]
     #[serde(with = "serde_bytes")]
     Update(Vec<u8>),
+    /// E2E encrypted update broadcast (opaque blob)
+    #[serde(rename = "x")]
+    #[serde(with = "serde_bytes")]
+    EncryptedUpdate(Vec<u8>),
     /// Awareness broadcast
     #[serde(rename = "a")]
     Awareness(rmpv::Value),
@@ -48,6 +56,10 @@ impl ClientMsg {
 
     pub fn update(data: Vec<u8>) -> Vec<u8> {
         rmp_serde::to_vec_named(&ClientMsg::Update(data)).unwrap_or_default()
+    }
+
+    pub fn encrypted_update(data: Vec<u8>) -> Vec<u8> {
+        rmp_serde::to_vec_named(&ClientMsg::EncryptedUpdate(data)).unwrap_or_default()
     }
 
     pub fn awareness(value: rmpv::Value) -> Vec<u8> {

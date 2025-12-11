@@ -49,11 +49,11 @@ pub fn encrypt(key_b64: &str, plaintext: &[u8]) -> Result<String, String> {
     // Generate random nonce
     let mut nonce_bytes = [0u8; NONCE_SIZE];
     OsRng.fill_bytes(&mut nonce_bytes);
-    let nonce = Nonce::from_slice(&nonce_bytes);
+    let nonce = Nonce::from(nonce_bytes);
 
     // Encrypt
     let ciphertext = cipher
-        .encrypt(nonce, plaintext)
+        .encrypt(&nonce, plaintext)
         .map_err(|e| format!("Encryption failed: {e}"))?;
 
     // Prepend nonce to ciphertext
@@ -91,13 +91,14 @@ pub fn decrypt(key_b64: &str, ciphertext_b64: &str) -> Result<Vec<u8>, String> {
     }
 
     let (nonce_bytes, ciphertext) = data.split_at(NONCE_SIZE);
-    let nonce = Nonce::from_slice(nonce_bytes);
+    let nonce_array: [u8; NONCE_SIZE] = nonce_bytes.try_into().map_err(|_| "Invalid nonce size")?;
+    let nonce = Nonce::from(nonce_array);
 
     let cipher = Aes256Gcm::new_from_slice(&key_bytes)
         .map_err(|e| format!("Failed to create cipher: {e}"))?;
 
     cipher
-        .decrypt(nonce, ciphertext)
+        .decrypt(&nonce, ciphertext)
         .map_err(|e| format!("Decryption failed: {e}"))
 }
 

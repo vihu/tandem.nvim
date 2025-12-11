@@ -31,10 +31,6 @@ jobs:
             target: x86_64-unknown-linux-gnu
             artifact_name: linux-x86_64
             ffi_ext: so
-          - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-            artifact_name: linux-aarch64
-            ffi_ext: so
           - os: macos-15
             target: aarch64-apple-darwin
             artifact_name: macos-aarch64
@@ -99,7 +95,6 @@ jobs:
       - name: Copy binaries to artifact directory
         run: |
           cp target/${{ matrix.target }}/release/libtandem_ffi.${{ matrix.ffi_ext }} artifact/tandem-${{ steps.version.outputs.VERSION }}-${{ matrix.artifact_name }}/tandem_ffi.so
-          cp target/${{ matrix.target }}/release/tandem-server artifact/tandem-${{ steps.version.outputs.VERSION }}-${{ matrix.artifact_name }}/
           echo "${{ steps.version.outputs.VERSION }}" > artifact/tandem-${{ steps.version.outputs.VERSION }}-${{ matrix.artifact_name }}/VERSION
 
       - name: Create tarball

@@ -3,15 +3,14 @@
 ![GitHub Actions Workflow Status](https://img.shields.io/github/actions/workflow/status/vihu/tandem.nvim/rust.yml)
 ![GitHub Release](https://img.shields.io/github/v/release/vihu/tandem.nvim)
 
-Real-time collaborative editing for Neovim using [Loro](https://github.com/loro-dev/loro) CRDT-based document synchronization.
+Real-time collaborative editing for Neovim. No server required.
 
 ## Features
 
-- **Real-time sync**: Edits sync between clients within 50ms
-- **CRDT-based**: Conflict-free resolution using Loro CRDT
+- **P2P connections**: Direct peer-to-peer via [Iroh](https://iroh.computer/) - no relay server needed
+- **E2E encrypted**: Automatic end-to-end encryption via QUIC/TLS 1.3
+- **CRDT-based**: Conflict-free resolution using [Loro](https://github.com/loro-dev/loro) CRDT
 - **Simple sharing**: Host a session, share the code, collaborate
-- **Automatic reconnection**: Exponential backoff with configurable retries
-- **Cursor awareness**: See other users' cursor positions
 - **Statusline integration**: Works with lualine and other statusline plugins
 
 ## Requirements
@@ -67,8 +66,6 @@ lua require("tandem").setup({ user_name = "your-name" })
 
 ### Building from source
 
-If pre-compiled binaries are unavailable for your platform, or you prefer to build from source:
-
 ```lua
 -- lazy.nvim
 {
@@ -89,44 +86,36 @@ Build dependencies:
 
 ### Hosting a Session
 
-Start a collaborative session on the current buffer:
-
 ```vim
 :TandemHost
 ```
 
 This will:
 
-1. Connect to the relay server
+1. Start a P2P endpoint
 2. Generate a shareable session code
 3. Copy the code to your clipboard
 
-Share the code with collaborators!
+Share the code with collaborators.
 
 ### Joining a Session
-
-Join using a session code from someone else:
 
 ```vim
 :TandemJoin <session-code>
 ```
 
+The connection is direct and encrypted - no data passes through any server.
+
 ### Commands
 
 | Command              | Description                     |
 | -------------------- | ------------------------------- |
-| `:TandemHost [name]` | Host a new session              |
+| `:TandemHost`        | Host a new session              |
 | `:TandemJoin <code>` | Join a session using a code     |
 | `:TandemLeave`       | Leave the current session       |
 | `:TandemCode`        | Copy current session code       |
 | `:TandemInfo`        | Show basic session info         |
 | `:TandemStatus`      | Show detailed connection status |
-
-### Leaving a Session
-
-```vim
-:TandemLeave
-```
 
 ## Configuration
 
@@ -135,19 +124,8 @@ require("tandem").setup({
   -- Display name shown to other users
   user_name = "nvim-user",
 
-  -- Default relay server
-  default_server = "ws://127.0.0.1:8080",
-
   -- Polling interval for sync updates (ms)
   poll_interval_ms = 50,
-
-  -- Reconnection settings
-  reconnect_max_retries = 10,      -- Max reconnection attempts
-  reconnect_base_delay_ms = 1000,  -- Initial delay (1 second)
-  reconnect_max_delay_ms = 30000,  -- Maximum delay (30 seconds)
-
-  -- Connection timeout (ms)
-  connection_timeout_ms = 10000,   -- 10 seconds
 
   -- Debug logging
   debug = false,
@@ -176,60 +154,19 @@ vim.o.statusline = "%{%v:lua.require('tandem').statusline()%}"
 
 Status indicators:
 
-- `[Tandem: synced]` - Connected and syncing
-- `[Tandem: connected]` - Connected, waiting for sync
-- `[Tandem: connecting...]` - Establishing connection
-- `[Tandem: reconnecting N/M]` - Reconnecting (attempt N of M)
+- `[Tandem P2P: synced[E2E]]` - Connected with encryption
+- `[Tandem P2P: connecting...]` - Establishing connection
 - Empty when not in a session
 
-## Running a Relay Server
-
-The plugin includes a relay server binary:
-
-```bash
-# If installed via pre-built binaries, find it in the bin/ directory
-./bin/tandem-server
-
-# Or build and run from source
-make server
-```
-
-This starts a WebSocket relay at `ws://127.0.0.1:8080` that:
-
-- Accepts connections at `/ws/{room-id}`
-- Maintains server-side CRDT for late joiners
-- Broadcasts updates to all peers in the same room
-
-### Server Configuration
-
-Configure via environment variables:
-
-| Variable              | Default          | Description              |
-| --------------------- | ---------------- | ------------------------ |
-| `TANDEM_BIND_ADDR`    | `127.0.0.1:8080` | Server bind address      |
-| `TANDEM_MAX_PEERS`    | `8`              | Max peers per room       |
-| `TANDEM_MAX_ROOMS`    | `1000000`        | Max total rooms          |
-| `TANDEM_MAX_DOC_SIZE` | `10485760`       | Max document size (10MB) |
-
 ## Health Check
-
-Verify your installation:
 
 ```vim
 :checkhealth tandem
 ```
 
-This checks:
-
-- Neovim version compatibility
-- FFI library loading
-- Required dependencies
-
 ## Troubleshooting
 
 ### "Failed to load tandem_ffi" error
-
-The FFI library wasn't found. Try:
 
 ```lua
 -- Re-run the installer
@@ -240,8 +177,6 @@ The FFI library wasn't found. Try:
 ```
 
 ### Build fails with "libluajit not found"
-
-Install LuaJIT development headers:
 
 ```bash
 # Debian/Ubuntu
@@ -254,12 +189,6 @@ sudo pacman -S luajit
 brew install luajit
 ```
 
-### Connection timeout
-
-- Verify the relay server is running
-- Check firewall settings
-- Try `:TandemStatus` for detailed connection info
-
 ### Sync issues
 
 Enable debug logging:
@@ -268,26 +197,24 @@ Enable debug logging:
 require("tandem").setup({ debug = true })
 ```
 
-Check `/tmp/tandem-nvim.log` for detailed Rust-side logs.
+Check `/tmp/tandem-nvim.log` for detailed logs.
 
 ## Architecture
 
 ```
-+-----------------------------------------------------------+
-|  Lua Layer (lua/tandem/)                                  |
-|  - init.lua:     Plugin entry, commands                   |
-|  - session.lua:  Connection lifecycle, sync loop          |
-|  - buffer.lua:   Buffer <-> CRDT bridge                   |
-|  - build.lua:    Auto-download pre-built binaries         |
-|  - health.lua:   :checkhealth integration                 |
-+-----------------------------------------------------------+
-|  Rust FFI (rust/tandem-ffi/)                              |
-|  - lib.rs:  nvim-oxi entry, FFI exports                   |
-|  - ws.rs:   Async WebSocket client (tokio-tungstenite)    |
-|  - crdt.rs: Loro LoroText wrapper                         |
-+-----------------------------------------------------------+
-|  tandem-server: WebSocket relay with server-side CRDT     |
-+-----------------------------------------------------------+
++---------------------------------------------------------------+
+|  Lua Layer (lua/tandem/)                                      |
+|  - init.lua:     Plugin entry, commands, setup()              |
+|  - session.lua:  P2P session lifecycle                        |
+|  - buffer.lua:   Buffer <-> CRDT synchronization              |
+|  - build.lua:    Auto-download pre-built binaries             |
+|  - health.lua:   :checkhealth integration                     |
++---------------------------------------------------------------+
+|  Rust FFI (src/)                                              |
+|  - lib.rs:         nvim-oxi entry, module exports             |
+|  - iroh_client.rs: P2P networking (QUIC/TLS 1.3)              |
+|  - crdt.rs:        Loro LoroDoc/LoroText wrapper              |
++---------------------------------------------------------------+
 ```
 
 ## License

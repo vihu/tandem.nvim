@@ -5,21 +5,16 @@ else
 	EXT := so
 endif
 
-.PHONY: build build-debug server clean
+.PHONY: build build-debug clean
 
 build:
-	cargo build --release -p tandem-ffi
-	mkdir -p rust/tandem-ffi/lua
-	cp target/release/libtandem_ffi.$(EXT) rust/tandem-ffi/lua/tandem_ffi.so
+	cargo build --release
+	cp target/release/libtandem_ffi.$(EXT) lua/tandem_ffi.so
 
 build-debug:
-	cargo build -p tandem-ffi
-	mkdir -p rust/tandem-ffi/lua
-	cp target/debug/libtandem_ffi.$(EXT) rust/tandem-ffi/lua/tandem_ffi.so
-
-server:
-	cargo run -p tandem-server --release
+	cargo build
+	cp target/debug/libtandem_ffi.$(EXT) lua/tandem_ffi.so
 
 clean:
 	cargo clean
-	rm -rf rust/tandem-ffi/lua
+	rm -f lua/tandem_ffi.so

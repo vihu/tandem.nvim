@@ -1,17 +1,25 @@
 //! Session code encoding/decoding.
 //!
-//! Session codes encode document ID and encryption key in a single base64url blob:
+//! Two formats supported:
+//!
+//! ## Legacy (WebSocket + E2E):
 //! `base64url(doc_id || 0x00 || 256-bit-key)`
 //!
-//! Example: "my-project" + key → ~58 character code
+//! ## P2P (Iroh):
+//! `base64url(endpoint_id_str || 0x01 || relay_url)`
+//! - endpoint_id_str: Iroh EndpointId as string (z32 encoded public key)
+//! - relay_url: URL of the relay server for NAT traversal
 
 use base64ct::{Base64UrlUnpadded, Encoding};
 use nvim_oxi::{Dictionary, Function, Object};
 
 use crate::crypto::KEY_SIZE;
 
-/// Separator byte between doc_id and key
+/// Separator byte between doc_id and key (legacy format)
 const SEPARATOR: u8 = 0x00;
+
+/// Separator byte for P2P format (EndpointId || relay_url)
+const P2P_SEPARATOR: u8 = 0x01;
 
 /// Encode document ID and encryption key into a session code.
 ///
@@ -71,9 +79,53 @@ pub fn decode(code: &str) -> Result<(String, String), String> {
     Ok((doc_id, key_b64))
 }
 
+// ============================================================================
+// P2P Session Code (Iroh)
+// ============================================================================
+
+/// Encode EndpointId and RelayUrl into a P2P session code.
+///
+/// Format: `base64url(endpoint_id_str || 0x01 || relay_url)`
+pub fn encode_p2p_session_code(endpoint_id: &str, relay_url: &str) -> Result<String, String> {
+    // Validate inputs don't contain the separator
+    if endpoint_id.as_bytes().contains(&P2P_SEPARATOR) {
+        return Err("Endpoint ID cannot contain separator byte".to_string());
+    }
+
+    // Build payload: endpoint_id || 0x01 || relay_url
+    let mut payload = Vec::with_capacity(endpoint_id.len() + 1 + relay_url.len());
+    payload.extend_from_slice(endpoint_id.as_bytes());
+    payload.push(P2P_SEPARATOR);
+    payload.extend_from_slice(relay_url.as_bytes());
+
+    Ok(Base64UrlUnpadded::encode_string(&payload))
+}
+
+/// Decode a P2P session code into (endpoint_id, relay_url).
+pub fn decode_p2p_session_code(code: &str) -> Result<(String, String), String> {
+    let payload = Base64UrlUnpadded::decode_vec(code)
+        .map_err(|e| format!("Invalid P2P session code base64: {e}"))?;
+
+    // Find separator
+    let sep_pos = payload
+        .iter()
+        .position(|&b| b == P2P_SEPARATOR)
+        .ok_or("Invalid P2P session code: missing separator (not a P2P code?)")?;
+
+    // Extract endpoint_id and relay_url
+    let endpoint_id = String::from_utf8(payload[..sep_pos].to_vec())
+        .map_err(|e| format!("Invalid endpoint ID UTF-8: {e}"))?;
+
+    let relay_url = String::from_utf8(payload[sep_pos + 1..].to_vec())
+        .map_err(|e| format!("Invalid relay URL UTF-8: {e}"))?;
+
+    Ok((endpoint_id, relay_url))
+}
+
 /// Export code functions to Lua via nvim-oxi.
 pub fn code_ffi() -> Dictionary {
     Dictionary::from_iter([
+        // Legacy (WebSocket + E2E)
         (
             "encode",
             Object::from(Function::<(String, String), String>::from_fn(
@@ -91,6 +143,29 @@ pub fn code_ffi() -> Dictionary {
                 |code| -> Result<(String, String), nvim_oxi::Error> {
                     match decode(&code) {
                         Ok((doc_id, key)) => Ok((doc_id, key)),
+                        Err(e) => Err(nvim_oxi::Error::Api(nvim_oxi::api::Error::Other(e))),
+                    }
+                },
+            )),
+        ),
+        // P2P (Iroh)
+        (
+            "encode_p2p",
+            Object::from(Function::<(String, String), String>::from_fn(
+                |(endpoint_id, relay_url)| -> Result<String, nvim_oxi::Error> {
+                    match encode_p2p_session_code(&endpoint_id, &relay_url) {
+                        Ok(code) => Ok(code),
+                        Err(e) => Err(nvim_oxi::Error::Api(nvim_oxi::api::Error::Other(e))),
+                    }
+                },
+            )),
+        ),
+        (
+            "decode_p2p",
+            Object::from(Function::<String, (String, String)>::from_fn(
+                |code| -> Result<(String, String), nvim_oxi::Error> {
+                    match decode_p2p_session_code(&code) {
+                        Ok((endpoint_id, relay_url)) => Ok((endpoint_id, relay_url)),
                         Err(e) => Err(nvim_oxi::Error::Api(nvim_oxi::api::Error::Other(e))),
                     }
                 },

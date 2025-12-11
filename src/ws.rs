@@ -2,8 +2,12 @@
 //!
 //! Uses `AsyncHandle` to immediately deliver WebSocket events to Lua callbacks
 //! instead of polling, eliminating race conditions from the event queue.
+//!
+//! Supports optional E2E encryption: if an encryption key is provided at connect time,
+//! all incoming data is decrypted and outgoing data is encrypted transparently.
 
 use base64::Engine;
+use base64ct::{Base64UrlUnpadded, Encoding as Base64UrlEncoding};
 use futures_util::{SinkExt, StreamExt};
 use log::{debug, error, info, warn};
 use nvim_oxi::{
@@ -16,12 +20,13 @@ use nvim_oxi::{
     schedule,
 };
 use parking_lot::Mutex;
-use std::{collections::HashMap, sync::LazyLock};
+use std::{collections::HashMap, sync::Arc, sync::LazyLock};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio_tungstenite::tungstenite::Message;
 use url::Url;
 use uuid::Uuid;
 
+use crate::crypto;
 use crate::protocol::{ClientMsg, ServerMsg};
 use crate::runtime;
 
@@ -54,6 +59,7 @@ pub enum WsEvent {
 enum OutboundMsg {
     SyncRequest,
     Update(Vec<u8>),
+    EncryptedUpdate(Vec<u8>),
     Awareness(rmpv::Value),
 }
 
@@ -119,11 +125,16 @@ struct WsClient {
     close_tx: UnboundedSender<()>,
     #[allow(dead_code)]
     lua_handle: AsyncHandle,
+    /// Optional E2E encryption key (base64url-encoded)
+    encryption_key: Option<Arc<String>>,
 }
 
 impl WsClient {
-    fn new(client_id: Uuid, url: String) -> Result<Self, String> {
+    fn new(client_id: Uuid, url: String, encryption_key: Option<String>) -> Result<Self, String> {
         let parsed_url = Url::parse(&url).map_err(|e| format!("Invalid URL: {}", e))?;
+
+        // Wrap encryption key in Arc for sharing with async task
+        let encryption_key = encryption_key.map(Arc::new);
 
         // Read callbacks from Lua globals (must be registered before connect)
         let callbacks = WsCallbacks::from_lua(client_id)?;
@@ -233,6 +244,7 @@ impl WsClient {
         let lua_handle_clone = lua_handle.clone();
         let inbound_tx_clone = inbound_tx.clone();
         let id = client_id;
+        let encryption_key_clone = encryption_key.clone();
 
         // Spawn WebSocket task
         runtime().spawn(async move {
@@ -243,6 +255,7 @@ impl WsClient {
                 &lua_handle_clone,
                 outbound_rx,
                 close_rx,
+                encryption_key_clone,
             )
             .await
             {
@@ -266,6 +279,7 @@ impl WsClient {
             outbound_tx,
             close_tx,
             lua_handle,
+            encryption_key,
         })
     }
 
@@ -276,8 +290,49 @@ impl WsClient {
     }
 
     fn send_update(&self, data: Vec<u8>) {
-        if let Err(e) = self.outbound_tx.send(OutboundMsg::Update(data)) {
-            error!("[ws:{}] Failed to queue update: {}", self.id, e);
+        // If encryption is enabled, encrypt and send as EncryptedUpdate
+        // Otherwise, send as regular Update
+        if let Some(ref key) = self.encryption_key {
+            info!(
+                "[ws:{}] Encrypting update ({} bytes plaintext)",
+                self.id,
+                data.len()
+            );
+            match crypto::encrypt(key, &data) {
+                Ok(encrypted_b64) => {
+                    // Decode the base64url string back to bytes for sending
+                    match Base64UrlUnpadded::decode_vec(&encrypted_b64) {
+                        Ok(encrypted_bytes) => {
+                            info!(
+                                "[ws:{}] Sending EncryptedUpdate ({} bytes ciphertext)",
+                                self.id,
+                                encrypted_bytes.len()
+                            );
+                            if let Err(e) = self
+                                .outbound_tx
+                                .send(OutboundMsg::EncryptedUpdate(encrypted_bytes))
+                            {
+                                error!("[ws:{}] Failed to queue encrypted update: {}", self.id, e);
+                            }
+                        }
+                        Err(e) => {
+                            error!("[ws:{}] Failed to decode encrypted data: {}", self.id, e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!("[ws:{}] Encryption failed: {}", self.id, e);
+                }
+            }
+        } else {
+            debug!(
+                "[ws:{}] Sending unencrypted Update ({} bytes)",
+                self.id,
+                data.len()
+            );
+            if let Err(e) = self.outbound_tx.send(OutboundMsg::Update(data)) {
+                error!("[ws:{}] Failed to queue update: {}", self.id, e);
+            }
         }
     }
 
@@ -300,6 +355,7 @@ async fn run_ws_client(
     lua_handle: &AsyncHandle,
     mut outbound_rx: UnboundedReceiver<OutboundMsg>,
     mut close_rx: UnboundedReceiver<()>,
+    encryption_key: Option<Arc<String>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     info!("[ws:{}] Connecting to {}", id, url);
 
@@ -338,14 +394,43 @@ async fn run_ws_client(
                         if let Some(server_msg) = ServerMsg::parse(&data) {
                             match server_msg {
                                 ServerMsg::SyncResponse(snapshot) => {
+                                    // SyncResponse from server is NOT encrypted
+                                    // (Server can't store/compact encrypted data, so E2E sessions
+                                    // will have empty SyncResponse and rely on EncryptedUpdate from peers)
                                     debug!("[ws:{}] SyncResponse ({} bytes)", id, snapshot.len());
                                     let b64 = base64::engine::general_purpose::STANDARD.encode(&snapshot);
                                     send_event(WsEvent::SyncResponse(b64));
                                 }
-                                ServerMsg::Update(data) => {
-                                    debug!("[ws:{}] Update ({} bytes)", id, data.len());
-                                    let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
+                                ServerMsg::Update(update_data) => {
+                                    // Regular Update - should only be received when NOT using E2E encryption
+                                    debug!("[ws:{}] Update ({} bytes)", id, update_data.len());
+                                    let b64 = base64::engine::general_purpose::STANDARD.encode(&update_data);
                                     send_event(WsEvent::Update(b64));
+                                }
+                                ServerMsg::EncryptedUpdate(encrypted_data) => {
+                                    // E2E encrypted update - decrypt and send as regular Update event
+                                    info!("[ws:{}] EncryptedUpdate received ({} bytes)", id, encrypted_data.len());
+                                    if let Some(ref key) = encryption_key {
+                                        if encrypted_data.is_empty() {
+                                            warn!("[ws:{}] Received empty EncryptedUpdate", id);
+                                            send_event(WsEvent::Update(String::new()));
+                                        } else {
+                                            // Convert to base64url for decryption
+                                            let encrypted_b64 = Base64UrlUnpadded::encode_string(&encrypted_data);
+                                            match crypto::decrypt(key, &encrypted_b64) {
+                                                Ok(decrypted) => {
+                                                    info!("[ws:{}] Decrypted update: {} bytes", id, decrypted.len());
+                                                    let b64 = base64::engine::general_purpose::STANDARD.encode(&decrypted);
+                                                    send_event(WsEvent::Update(b64));
+                                                }
+                                                Err(e) => {
+                                                    error!("[ws:{}] EncryptedUpdate decryption FAILED: {}", id, e);
+                                                }
+                                            }
+                                        }
+                                    } else {
+                                        error!("[ws:{}] Received EncryptedUpdate but no encryption key configured!", id);
+                                    }
                                 }
                                 ServerMsg::Awareness(value) => {
                                     debug!("[ws:{}] Awareness update", id);
@@ -395,6 +480,10 @@ async fn run_ws_client(
                             debug!("[ws:{}] Sending Update ({} bytes)", id, update.len());
                             ClientMsg::update(update)
                         }
+                        OutboundMsg::EncryptedUpdate(encrypted) => {
+                            debug!("[ws:{}] Sending EncryptedUpdate ({} bytes)", id, encrypted.len());
+                            ClientMsg::encrypted_update(encrypted)
+                        }
                         OutboundMsg::Awareness(value) => {
                             debug!("[ws:{}] Sending Awareness", id);
                             ClientMsg::awareness(value)
@@ -423,10 +512,10 @@ async fn run_ws_client(
 // FFI Functions
 // ============================================================================
 
-/// Connect to a WebSocket URL.
+/// Connect to a WebSocket URL with optional E2E encryption.
 /// IMPORTANT: Callbacks must be registered in _G["_TANDEM_NVIM"].ws.callbacks[client_id] BEFORE calling this.
-/// Args: (client_id, url) - client_id is generated by Lua and passed here
-fn ws_connect((client_id, url): (String, String)) -> bool {
+/// Args: (client_id, url, encryption_key) - encryption_key is empty string if not using E2EE
+fn ws_connect((client_id, url, encryption_key): (String, String, String)) -> bool {
     let id = match Uuid::parse_str(&client_id) {
         Ok(id) => id,
         Err(e) => {
@@ -435,10 +524,21 @@ fn ws_connect((client_id, url): (String, String)) -> bool {
         }
     };
 
-    match WsClient::new(id, url) {
+    // Convert empty string to None for encryption key
+    let key = if encryption_key.is_empty() {
+        None
+    } else {
+        Some(encryption_key)
+    };
+
+    match WsClient::new(id, url, key.clone()) {
         Ok(client) => {
+            let is_encrypted = client.encryption_key.is_some();
             CLIENTS.lock().insert(id, client);
-            info!("[ws:{}] Client created and connecting", id);
+            info!(
+                "[ws:{}] Client created and connecting (encrypted: {})",
+                id, is_encrypted
+            );
             true
         }
         Err(e) => {
@@ -554,7 +654,7 @@ pub fn ws_ffi() -> Dictionary {
         ),
         (
             "connect",
-            Object::from(Function::<(String, String), bool>::from_fn(
+            Object::from(Function::<(String, String, String), bool>::from_fn(
                 |args| -> Result<bool, nvim_oxi::Error> { Ok(ws_connect(args)) },
             )),
         ),

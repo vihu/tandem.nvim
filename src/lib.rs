@@ -13,6 +13,7 @@ mod auth;
 mod code;
 mod crdt;
 mod crypto;
+mod iroh_client;
 mod protocol;
 mod ws;
 
@@ -57,11 +58,12 @@ fn tandem_ffi() -> nvim_oxi::Result<Dictionary> {
     info!("tandem_ffi plugin loaded");
 
     let api = Dictionary::from_iter([
-        ("ws", nvim_oxi::Object::from(ws::ws_ffi())),
-        ("crdt", nvim_oxi::Object::from(crdt::crdt_ffi())),
         ("auth", nvim_oxi::Object::from(auth::auth_ffi())),
-        ("crypto", nvim_oxi::Object::from(crypto::crypto_ffi())),
         ("code", nvim_oxi::Object::from(code::code_ffi())),
+        ("crdt", nvim_oxi::Object::from(crdt::crdt_ffi())),
+        ("crypto", nvim_oxi::Object::from(crypto::crypto_ffi())),
+        ("iroh", nvim_oxi::Object::from(iroh_client::iroh_ffi())),
+        ("ws", nvim_oxi::Object::from(ws::ws_ffi())),
     ]);
 
     Ok(api)
