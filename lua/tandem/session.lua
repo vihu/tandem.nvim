@@ -198,10 +198,15 @@ local function register_callbacks(client_id)
 			-- Clean up remote cursor
 			cursor.remove_remote(peer_id)
 
-			-- Only mark disconnected if we're not the host
-			if session.role ~= "host" then
+			-- Check if all peers have disconnected
+			if next(session.peers) == nil then
+				-- No peers remaining - mark as disconnected
 				session.connected = false
-				session.synced = false
+				-- Host remains synced (local CRDT is authoritative)
+				-- Joiner loses sync since host is gone
+				if session.role ~= "host" then
+					session.synced = false
+				end
 			end
 		end,
 

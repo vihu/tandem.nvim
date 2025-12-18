@@ -19,7 +19,10 @@ use nvim_oxi::{
 };
 use parking_lot::Mutex;
 use std::{collections::HashMap, sync::Arc, sync::LazyLock};
-use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use tokio::sync::{
+    mpsc::{self, UnboundedReceiver, UnboundedSender},
+    oneshot,
+};
 use uuid::Uuid;
 
 use crate::runtime;
@@ -103,8 +106,8 @@ struct IrohClient {
     id: Uuid,
     outbound_tx: UnboundedSender<OutboundMsg>,
     close_tx: UnboundedSender<()>,
-    #[allow(dead_code)]
-    lua_handle: AsyncHandle, // Keep alive to receive async notifications
+    /// Kept alive to receive async notifications (not directly accessed)
+    _lua_handle: AsyncHandle,
 }
 
 impl IrohClient {
@@ -246,7 +249,7 @@ impl IrohClient {
             id: client_id,
             outbound_tx,
             close_tx,
-            lua_handle,
+            _lua_handle: lua_handle,
         })
     }
 
@@ -343,6 +346,9 @@ async fn run_host(
                             let (peer_tx, peer_rx) = mpsc::unbounded_channel::<OutboundMsg>();
                             let peer_id_holder: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
+                            // Create oneshot channel to signal when peer_id is known
+                            let (peer_id_tx, peer_id_rx) = oneshot::channel::<String>();
+
                             // Clone for the connection handler
                             let peer_id_holder_for_handler = peer_id_holder.clone();
                             let peers_for_handler = peers.clone();
@@ -355,6 +361,7 @@ async fn run_host(
                                     &lua_handle,
                                     peer_rx,
                                     peer_id_holder_for_handler.clone(),
+                                    peer_id_tx,
                                 ).await {
                                     error!("[iroh:{}] Peer connection error: {}", host_id, e);
                                 }
@@ -364,20 +371,25 @@ async fn run_host(
                                 }
                             });
 
-                            // Store sender with temporary key
+                            // Store sender with temporary key until peer_id is known
                             let temp_key = format!("pending_{}", uuid::Uuid::new_v4());
                             peers.lock().insert(temp_key.clone(), peer_tx);
 
-                            // Spawn a task to update the key once peer_id is known
+                            // Spawn task to update the key once peer_id is signaled
                             let peers_for_update = peers.clone();
-                            let peer_id_holder_for_update = peer_id_holder.clone();
                             tokio::spawn(async move {
-                                // Wait a bit for the peer_id to be set
-                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                                if let Some(real_peer_id) = peer_id_holder_for_update.lock().clone() {
-                                    let mut peers_guard = peers_for_update.lock();
-                                    if let Some(tx) = peers_guard.remove(&temp_key) {
-                                        peers_guard.insert(real_peer_id, tx);
+                                // Wait for peer_id signal (no timing assumptions)
+                                match peer_id_rx.await {
+                                    Ok(real_peer_id) => {
+                                        let mut peers_guard = peers_for_update.lock();
+                                        if let Some(tx) = peers_guard.remove(&temp_key) {
+                                            peers_guard.insert(real_peer_id, tx);
+                                        }
+                                    }
+                                    Err(_) => {
+                                        // Connection handler dropped sender without sending
+                                        // (likely connection failed before peer_id was known)
+                                        peers_for_update.lock().remove(&temp_key);
                                     }
                                 }
                             });
@@ -462,6 +474,7 @@ async fn handle_peer_connection(
     lua_handle: &AsyncHandle,
     mut peer_rx: UnboundedReceiver<OutboundMsg>,
     peer_id_out: Arc<Mutex<Option<String>>>,
+    peer_id_tx: oneshot::Sender<String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let conn = accepting.await?;
     let peer_id = conn.remote_id().to_string();
@@ -470,6 +483,9 @@ async fn handle_peer_connection(
 
     // Store peer_id so caller can clean up
     *peer_id_out.lock() = Some(peer_id.clone());
+
+    // Signal the peer_id is ready (for peer map key update)
+    let _ = peer_id_tx.send(peer_id.clone());
 
     // Notify Lua - this triggers on_peer_connected which calls send_full_state
     let _ = event_tx.send(IrohEvent::PeerConnected {

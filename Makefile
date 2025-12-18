@@ -5,7 +5,7 @@ else
 	EXT := so
 endif
 
-.PHONY: build build-debug clean
+.PHONY: build build-debug clean test
 
 build:
 	cargo build --release
@@ -18,3 +18,6 @@ build-debug:
 clean:
 	cargo clean
 	rm -f lua/tandem_ffi.so
+
+test:
+	cargo nextest run
