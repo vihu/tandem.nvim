@@ -19,13 +19,21 @@ use nvim_oxi::{
 };
 use parking_lot::Mutex;
 use std::{collections::HashMap, sync::Arc, sync::LazyLock};
-use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use tokio::sync::{
+    mpsc::{self, UnboundedReceiver, UnboundedSender},
+    oneshot,
+};
 use uuid::Uuid;
 
 use crate::runtime;
 
 /// ALPN protocol identifier for tandem CRDT sync
 const TANDEM_ALPN: &[u8] = b"tandem/crdt/1";
+
+/// Message type constants for wire protocol
+const MSG_FULL_STATE: u8 = 0x01;
+const MSG_UPDATE: u8 = 0x02;
+const MSG_PRESENCE: u8 = 0x03;
 
 /// Global registry of Iroh clients
 static CLIENTS: LazyLock<Mutex<HashMap<Uuid, IrohClient>>> =
@@ -47,6 +55,8 @@ pub enum IrohEvent {
     FullState(String),
     /// Received CRDT update (base64 encoded)
     Update(String),
+    /// Received presence/cursor update (peer_id, JSON data)
+    Presence { peer_id: String, data: String },
     /// Error occurred
     Error(String),
 }
@@ -58,6 +68,8 @@ enum OutboundMsg {
     FullState(Vec<u8>),
     /// Send incremental CRDT update
     Update(Vec<u8>),
+    /// Send presence/cursor update (JSON bytes)
+    Presence(Vec<u8>),
 }
 
 /// Helper to invoke a Lua callback by name from the global registry
@@ -94,8 +106,8 @@ struct IrohClient {
     id: Uuid,
     outbound_tx: UnboundedSender<OutboundMsg>,
     close_tx: UnboundedSender<()>,
-    #[allow(dead_code)]
-    lua_handle: AsyncHandle, // Keep alive to receive async notifications
+    /// Kept alive to receive async notifications (not directly accessed)
+    _lua_handle: AsyncHandle,
 }
 
 impl IrohClient {
@@ -173,6 +185,9 @@ impl IrohClient {
                         IrohEvent::Update(data_b64) => {
                             invoke_callback(&id, "on_update", (id.clone(), data_b64));
                         }
+                        IrohEvent::Presence { peer_id, data } => {
+                            invoke_callback(&id, "on_presence", (id.clone(), peer_id, data));
+                        }
                         IrohEvent::Error(err) => {
                             invoke_callback(&id, "on_error", (id.clone(), err));
                         }
@@ -234,7 +249,7 @@ impl IrohClient {
             id: client_id,
             outbound_tx,
             close_tx,
-            lua_handle,
+            _lua_handle: lua_handle,
         })
     }
 
@@ -247,6 +262,12 @@ impl IrohClient {
     fn send_update(&self, data: Vec<u8>) {
         if let Err(e) = self.outbound_tx.send(OutboundMsg::Update(data)) {
             error!("[iroh:{}] Failed to queue update: {}", self.id, e);
+        }
+    }
+
+    fn send_presence(&self, data: Vec<u8>) {
+        if let Err(e) = self.outbound_tx.send(OutboundMsg::Presence(data)) {
+            error!("[iroh:{}] Failed to queue presence: {}", self.id, e);
         }
     }
 
@@ -325,6 +346,9 @@ async fn run_host(
                             let (peer_tx, peer_rx) = mpsc::unbounded_channel::<OutboundMsg>();
                             let peer_id_holder: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
+                            // Create oneshot channel to signal when peer_id is known
+                            let (peer_id_tx, peer_id_rx) = oneshot::channel::<String>();
+
                             // Clone for the connection handler
                             let peer_id_holder_for_handler = peer_id_holder.clone();
                             let peers_for_handler = peers.clone();
@@ -337,6 +361,7 @@ async fn run_host(
                                     &lua_handle,
                                     peer_rx,
                                     peer_id_holder_for_handler.clone(),
+                                    peer_id_tx,
                                 ).await {
                                     error!("[iroh:{}] Peer connection error: {}", host_id, e);
                                 }
@@ -346,20 +371,25 @@ async fn run_host(
                                 }
                             });
 
-                            // Store sender with temporary key
+                            // Store sender with temporary key until peer_id is known
                             let temp_key = format!("pending_{}", uuid::Uuid::new_v4());
                             peers.lock().insert(temp_key.clone(), peer_tx);
 
-                            // Spawn a task to update the key once peer_id is known
+                            // Spawn task to update the key once peer_id is signaled
                             let peers_for_update = peers.clone();
-                            let peer_id_holder_for_update = peer_id_holder.clone();
                             tokio::spawn(async move {
-                                // Wait a bit for the peer_id to be set
-                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                                if let Some(real_peer_id) = peer_id_holder_for_update.lock().clone() {
-                                    let mut peers_guard = peers_for_update.lock();
-                                    if let Some(tx) = peers_guard.remove(&temp_key) {
-                                        peers_guard.insert(real_peer_id, tx);
+                                // Wait for peer_id signal (no timing assumptions)
+                                match peer_id_rx.await {
+                                    Ok(real_peer_id) => {
+                                        let mut peers_guard = peers_for_update.lock();
+                                        if let Some(tx) = peers_guard.remove(&temp_key) {
+                                            peers_guard.insert(real_peer_id, tx);
+                                        }
+                                    }
+                                    Err(_) => {
+                                        // Connection handler dropped sender without sending
+                                        // (likely connection failed before peer_id was known)
+                                        peers_for_update.lock().remove(&temp_key);
                                     }
                                 }
                             });
@@ -395,28 +425,39 @@ async fn run_host(
     Ok(())
 }
 
-/// Read a length-prefixed message from stream
+/// Read a typed, length-prefixed message from stream
+/// Returns (message_type, data)
 async fn read_message(
     recv: &mut iroh::endpoint::RecvStream,
-) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(u8, Vec<u8>), Box<dyn std::error::Error + Send + Sync>> {
+    // Read message type (1 byte)
+    let mut type_buf = [0u8; 1];
+    recv.read_exact(&mut type_buf).await?;
+    let msg_type = type_buf[0];
+
+    // Read length (4 bytes)
     let mut len_buf = [0u8; 4];
     recv.read_exact(&mut len_buf).await?;
     let len = u32::from_be_bytes(len_buf) as usize;
 
     if len == 0 {
-        return Ok(Vec::new());
+        return Ok((msg_type, Vec::new()));
     }
 
     let mut data = vec![0u8; len];
     recv.read_exact(&mut data).await?;
-    Ok(data)
+    Ok((msg_type, data))
 }
 
-/// Write a length-prefixed message to stream
+/// Write a typed, length-prefixed message to stream
 async fn write_message(
     send: &mut iroh::endpoint::SendStream,
+    msg_type: u8,
     data: &[u8],
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Write message type (1 byte)
+    send.write_all(&[msg_type]).await?;
+    // Write length (4 bytes)
     let len = data.len() as u32;
     send.write_all(&len.to_be_bytes()).await?;
     if !data.is_empty() {
@@ -433,6 +474,7 @@ async fn handle_peer_connection(
     lua_handle: &AsyncHandle,
     mut peer_rx: UnboundedReceiver<OutboundMsg>,
     peer_id_out: Arc<Mutex<Option<String>>>,
+    peer_id_tx: oneshot::Sender<String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let conn = accepting.await?;
     let peer_id = conn.remote_id().to_string();
@@ -441,6 +483,9 @@ async fn handle_peer_connection(
 
     // Store peer_id so caller can clean up
     *peer_id_out.lock() = Some(peer_id.clone());
+
+    // Signal the peer_id is ready (for peer map key update)
+    let _ = peer_id_tx.send(peer_id.clone());
 
     // Notify Lua - this triggers on_peer_connected which calls send_full_state
     let _ = event_tx.send(IrohEvent::PeerConnected {
@@ -460,43 +505,67 @@ async fn handle_peer_connection(
 
     match initial {
         Ok(Some(msg)) => {
-            let data = match msg {
-                OutboundMsg::FullState(d) | OutboundMsg::Update(d) => d,
+            let (msg_type, data) = match msg {
+                OutboundMsg::FullState(d) => (MSG_FULL_STATE, d),
+                OutboundMsg::Update(d) => (MSG_UPDATE, d),
+                OutboundMsg::Presence(d) => (MSG_PRESENCE, d),
             };
             info!(
                 "[iroh:{}] Sending initial state to peer ({} bytes)",
                 host_id,
                 data.len()
             );
-            write_message(&mut send, &data).await?;
+            write_message(&mut send, msg_type, &data).await?;
         }
         Ok(None) => {
             warn!(
                 "[iroh:{}] Outbound channel closed before initial state",
                 host_id
             );
-            write_message(&mut send, &[]).await?;
+            write_message(&mut send, MSG_FULL_STATE, &[]).await?;
         }
         Err(_) => {
             warn!(
                 "[iroh:{}] Timeout waiting for initial state, sending empty",
                 host_id
             );
-            write_message(&mut send, &[]).await?;
+            write_message(&mut send, MSG_FULL_STATE, &[]).await?;
         }
     }
 
     loop {
         tokio::select! {
-            // Receive from peer (length-prefixed)
+            // Receive from peer (typed, length-prefixed)
             result = read_message(&mut recv) => {
                 match result {
-                    Ok(data) => {
+                    Ok((msg_type, data)) => {
                         if !data.is_empty() {
-                            info!("[iroh:{}] Received update from peer ({} bytes)", host_id, data.len());
-                            let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
-                            let _ = event_tx.send(IrohEvent::Update(b64));
-                            let _ = lua_handle.send();
+                            match msg_type {
+                                MSG_FULL_STATE => {
+                                    info!("[iroh:{}] Received full state from peer ({} bytes)", host_id, data.len());
+                                    let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
+                                    let _ = event_tx.send(IrohEvent::FullState(b64));
+                                    let _ = lua_handle.send();
+                                }
+                                MSG_UPDATE => {
+                                    info!("[iroh:{}] Received update from peer ({} bytes)", host_id, data.len());
+                                    let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
+                                    let _ = event_tx.send(IrohEvent::Update(b64));
+                                    let _ = lua_handle.send();
+                                }
+                                MSG_PRESENCE => {
+                                    debug!("[iroh:{}] Received presence from peer ({} bytes)", host_id, data.len());
+                                    let json = String::from_utf8_lossy(&data).to_string();
+                                    let _ = event_tx.send(IrohEvent::Presence {
+                                        peer_id: peer_id.clone(),
+                                        data: json,
+                                    });
+                                    let _ = lua_handle.send();
+                                }
+                                _ => {
+                                    warn!("[iroh:{}] Unknown message type: {}", host_id, msg_type);
+                                }
+                            }
                         }
                     }
                     Err(e) => {
@@ -506,15 +575,16 @@ async fn handle_peer_connection(
                 }
             }
 
-            // Send to peer (length-prefixed)
+            // Send to peer (typed, length-prefixed)
             msg = peer_rx.recv() => {
                 if let Some(msg) = msg {
-                    let data = match msg {
-                        OutboundMsg::FullState(d) => d,
-                        OutboundMsg::Update(d) => d,
+                    let (msg_type, data) = match msg {
+                        OutboundMsg::FullState(d) => (MSG_FULL_STATE, d),
+                        OutboundMsg::Update(d) => (MSG_UPDATE, d),
+                        OutboundMsg::Presence(d) => (MSG_PRESENCE, d),
                     };
-                    info!("[iroh:{}] Sending update to peer ({} bytes)", host_id, data.len());
-                    if let Err(e) = write_message(&mut send, &data).await {
+                    debug!("[iroh:{}] Sending message type {} to peer ({} bytes)", host_id, msg_type, data.len());
+                    if let Err(e) = write_message(&mut send, msg_type, &data).await {
                         error!("[iroh:{}] Failed to send to peer {}: {}", host_id, peer_id, e);
                         break;
                     }
@@ -551,8 +621,8 @@ async fn run_joiner(
     };
 
     // Decode session code to get host's endpoint_id and relay_url
-    let (host_endpoint_id, host_relay_url) = crate::code::decode_p2p_session_code(&session_code)
-        .map_err(|e| format!("Invalid session code: {}", e))?;
+    let (host_endpoint_id, host_relay_url): (String, String) =
+        crate::code::decode(&session_code).map_err(|e| format!("Invalid session code: {}", e))?;
 
     info!(
         "[iroh:{}] Connecting to host: endpoint_id={}, relay_url={}",
@@ -612,29 +682,50 @@ async fn run_joiner(
     let (mut send, mut recv) = conn.accept_bi().await?;
     info!("[iroh:{}] Bi stream accepted", id);
 
-    // First, receive full state from host (length-prefixed)
+    // First, receive full state from host (typed, length-prefixed)
     info!("[iroh:{}] Waiting for initial state from host...", id);
-    let initial_data = read_message(&mut recv).await?;
+    let (initial_type, initial_data) = read_message(&mut recv).await?;
     info!(
-        "[iroh:{}] Received initial state ({} bytes)",
+        "[iroh:{}] Received initial message type {} ({} bytes)",
         id,
+        initial_type,
         initial_data.len()
     );
-    if !initial_data.is_empty() {
+    if !initial_data.is_empty() && initial_type == MSG_FULL_STATE {
         let b64 = base64::engine::general_purpose::STANDARD.encode(&initial_data);
         send_event(IrohEvent::FullState(b64));
     }
 
     loop {
         tokio::select! {
-            // Receive updates from host (length-prefixed)
+            // Receive messages from host (typed, length-prefixed)
             result = read_message(&mut recv) => {
                 match result {
-                    Ok(data) => {
+                    Ok((msg_type, data)) => {
                         if !data.is_empty() {
-                            info!("[iroh:{}] Received update from host ({} bytes)", id, data.len());
-                            let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
-                            send_event(IrohEvent::Update(b64));
+                            match msg_type {
+                                MSG_FULL_STATE => {
+                                    info!("[iroh:{}] Received full state from host ({} bytes)", id, data.len());
+                                    let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
+                                    send_event(IrohEvent::FullState(b64));
+                                }
+                                MSG_UPDATE => {
+                                    info!("[iroh:{}] Received update from host ({} bytes)", id, data.len());
+                                    let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
+                                    send_event(IrohEvent::Update(b64));
+                                }
+                                MSG_PRESENCE => {
+                                    debug!("[iroh:{}] Received presence from host ({} bytes)", id, data.len());
+                                    let json = String::from_utf8_lossy(&data).to_string();
+                                    send_event(IrohEvent::Presence {
+                                        peer_id: peer_id.clone(),
+                                        data: json,
+                                    });
+                                }
+                                _ => {
+                                    warn!("[iroh:{}] Unknown message type: {}", id, msg_type);
+                                }
+                            }
                         }
                     }
                     Err(e) => {
@@ -644,15 +735,16 @@ async fn run_joiner(
                 }
             }
 
-            // Send outbound messages (length-prefixed)
+            // Send outbound messages (typed, length-prefixed)
             msg = outbound_rx.recv() => {
                 if let Some(msg) = msg {
-                    let data = match msg {
-                        OutboundMsg::FullState(d) => d,
-                        OutboundMsg::Update(d) => d,
+                    let (msg_type, data) = match msg {
+                        OutboundMsg::FullState(d) => (MSG_FULL_STATE, d),
+                        OutboundMsg::Update(d) => (MSG_UPDATE, d),
+                        OutboundMsg::Presence(d) => (MSG_PRESENCE, d),
                     };
-                    info!("[iroh:{}] Sending update to host ({} bytes)", id, data.len());
-                    if let Err(e) = write_message(&mut send, &data).await {
+                    debug!("[iroh:{}] Sending message type {} to host ({} bytes)", id, msg_type, data.len());
+                    if let Err(e) = write_message(&mut send, msg_type, &data).await {
                         error!("[iroh:{}] Failed to send: {}", id, e);
                         break;
                     }
@@ -772,6 +864,22 @@ fn iroh_send_update((client_id, data_b64): (String, String)) {
     }
 }
 
+/// Send presence/cursor update to peers (JSON string)
+fn iroh_send_presence((client_id, json): (String, String)) {
+    let id = match Uuid::parse_str(&client_id) {
+        Ok(id) => id,
+        Err(e) => {
+            warn!("Invalid client ID '{}': {}", client_id, e);
+            return;
+        }
+    };
+
+    let clients = CLIENTS.lock();
+    if let Some(client) = clients.get(&id) {
+        client.send_presence(json.into_bytes());
+    }
+}
+
 /// Close an Iroh client
 fn iroh_close(client_id: String) {
     let id = match Uuid::parse_str(&client_id) {
@@ -838,6 +946,15 @@ pub fn iroh_ffi() -> Dictionary {
             Object::from(Function::<(String, String), ()>::from_fn(
                 |args| -> Result<(), nvim_oxi::Error> {
                     iroh_send_update(args);
+                    Ok(())
+                },
+            )),
+        ),
+        (
+            "send_presence",
+            Object::from(Function::<(String, String), ()>::from_fn(
+                |args| -> Result<(), nvim_oxi::Error> {
+                    iroh_send_presence(args);
                     Ok(())
                 },
             )),

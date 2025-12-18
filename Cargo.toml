@@ -13,7 +13,6 @@ aes-gcm = "0.10"
 base64 = "0.22"
 base64ct = { version = "1", features = ["alloc"] }
 chrono = { version = "0.4", features = ["serde"] }
-futures-util = "0.3"
 iroh = "0.95"
 jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto"] }
 log = "0.4"
@@ -23,12 +22,7 @@ loro = "1"
 nvim-oxi = { version = "0.6", features = ["neovim-0-11", "mlua", "libuv"] }
 parking_lot = "0.12"
 rand = "0.9"
-rmp-serde = "1"
-rmpv = { version = "1", features = ["with-serde"] }
 serde = { version = "1", features = ["derive"] }
-serde_bytes = "0.11"
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
-tokio-tungstenite = { version = "0.28", features = ["native-tls"] }
-url = "2"
 uuid = { version = "1", features = ["v4"] }
