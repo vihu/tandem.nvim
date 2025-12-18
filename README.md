@@ -10,7 +10,9 @@ Real-time collaborative editing for Neovim. No server required.
 - **P2P connections**: Direct peer-to-peer via [Iroh](https://iroh.computer/) - no relay server needed
 - **E2E encrypted**: Automatic end-to-end encryption via QUIC/TLS 1.3
 - **CRDT-based**: Conflict-free resolution using [Loro](https://github.com/loro-dev/loro) CRDT
+- **Remote cursors**: See collaborators' cursor positions in real-time
 - **Simple sharing**: Host a session, share the code, collaborate
+- **Zero config**: Username auto-generated from `$USER`
 - **Statusline integration**: Works with lualine and other statusline plugins
 
 ## Requirements
@@ -32,9 +34,7 @@ Pre-compiled binaries are automatically downloaded for Linux and macOS (x86_64 a
     require("tandem.build").install()
   end,
   config = function()
-    require("tandem").setup({
-      user_name = "your-name",
-    })
+    require("tandem").setup()
   end,
 }
 ```
@@ -48,9 +48,7 @@ use {
     require("tandem.build").install()
   end,
   config = function()
-    require("tandem").setup({
-      user_name = "your-name",
-    })
+    require("tandem").setup()
   end,
 }
 ```
@@ -61,7 +59,7 @@ use {
 Plug 'vihu/tandem.nvim', { 'do': ':lua require("tandem.build").install()' }
 
 " In your init.vim or after/plugin:
-lua require("tandem").setup({ user_name = "your-name" })
+lua require("tandem").setup()
 ```
 
 ### Building from source
@@ -114,16 +112,14 @@ The connection is direct and encrypted - no data passes through any server.
 | `:TandemJoin <code>` | Join a session using a code     |
 | `:TandemLeave`       | Leave the current session       |
 | `:TandemCode`        | Copy current session code       |
-| `:TandemInfo`        | Show basic session info         |
 | `:TandemStatus`      | Show detailed connection status |
 
 ## Configuration
 
+All settings are optional:
+
 ```lua
 require("tandem").setup({
-  -- Display name shown to other users
-  user_name = "nvim-user",
-
   -- Polling interval for sync updates (ms)
   poll_interval_ms = 50,
 
@@ -131,6 +127,8 @@ require("tandem").setup({
   debug = false,
 })
 ```
+
+Username is auto-generated from `$USER` with a random suffix (e.g., `alice-7f3a2b`).
 
 ## Statusline Integration
 
@@ -154,8 +152,9 @@ vim.o.statusline = "%{%v:lua.require('tandem').statusline()%}"
 
 Status indicators:
 
-- `[Tandem P2P: synced[E2E]]` - Connected with encryption
-- `[Tandem P2P: connecting...]` - Establishing connection
+- `[Tandem: synced]` - Connected and synchronized
+- `[Tandem: connected]` - Connected, syncing
+- `[Tandem: connecting...]` - Establishing connection
 - Empty when not in a session
 
 ## Health Check
@@ -205,15 +204,17 @@ Check `/tmp/tandem-nvim.log` for detailed logs.
 +---------------------------------------------------------------+
 |  Lua Layer (lua/tandem/)                                      |
 |  - init.lua:     Plugin entry, commands, setup()              |
-|  - session.lua:  P2P session lifecycle                        |
+|  - session.lua:  P2P session lifecycle, presence sync         |
 |  - buffer.lua:   Buffer <-> CRDT synchronization              |
+|  - cursor.lua:   Remote cursor display via extmarks           |
 |  - build.lua:    Auto-download pre-built binaries             |
 |  - health.lua:   :checkhealth integration                     |
 +---------------------------------------------------------------+
 |  Rust FFI (src/)                                              |
 |  - lib.rs:         nvim-oxi entry, module exports             |
-|  - iroh_client.rs: P2P networking (QUIC/TLS 1.3)              |
+|  - iroh_client.rs: P2P networking (QUIC/TLS 1.3), presence    |
 |  - crdt.rs:        Loro LoroDoc/LoroText wrapper              |
+|  - code.rs:        Session code encoding/decoding             |
 +---------------------------------------------------------------+
 ```
 

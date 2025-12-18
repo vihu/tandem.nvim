@@ -14,10 +14,8 @@ mod code;
 mod crdt;
 mod crypto;
 mod iroh_client;
-mod protocol;
-mod ws;
 
-/// Global async runtime for WebSocket operations
+/// Global async runtime for P2P operations
 static ASYNC_RUNTIME: OnceLock<Runtime> = OnceLock::new();
 
 pub fn runtime() -> &'static Runtime {
@@ -63,7 +61,6 @@ fn tandem_ffi() -> nvim_oxi::Result<Dictionary> {
         ("crdt", nvim_oxi::Object::from(crdt::crdt_ffi())),
         ("crypto", nvim_oxi::Object::from(crypto::crypto_ffi())),
         ("iroh", nvim_oxi::Object::from(iroh_client::iroh_ffi())),
-        ("ws", nvim_oxi::Object::from(ws::ws_ffi())),
     ]);
 
     Ok(api)
